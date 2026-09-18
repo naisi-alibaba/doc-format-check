@@ -1,0 +1,24 @@
+{
+  "name": "generic",
+  "heading_level": null,
+  "num_space": "always",
+  "quote_style": "detect",
+  "no_space_brands": [],
+  "project_names": [],
+  "path_line_labels": ["前往路径", "路径", "入口"],
+  "path_context": [],
+  "internal_marks": ["待确认", "待补充", "待改写", "占位", "TODO", "TBD"],
+  "rival_marks": [],
+
+  "typo_fix": [],
+  "typo_fix_disable": [],
+
+  "typo_pairs": [
+    ["登陆", "登录"],
+    ["其它", "其他"],
+    ["须要", "需要"]
+  ],
+
+  "absolute_claims": ["绝对安全", "绝对不会", "100%", "永不", "万无一失", "完全不会"],
+  "faq_heading": "常见问题"
+}

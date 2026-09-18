@@ -1,0 +1,15 @@
+# 项目私有 profile，不入库
+.docformat.json
+
+# 处理记录
+format-record.md
+_backup/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
