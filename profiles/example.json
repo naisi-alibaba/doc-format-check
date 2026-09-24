@@ -1,36 +1,81 @@
 {
   "name": "example-product-manual",
-
   "heading_level": 3,
   "num_space": "always",
   "quote_style": "detect",
   "faq_heading": "常见问题",
-
-  "no_space_brands": ["豆瓣FM"],
-
-  "project_names": [
-    { "wrong": ["ACMEOS", "Acme OS", "ACME-OS"], "correct": "AcmeOS" },
-    { "wrong": ["acmeassistant", "Acme-Assistant"], "correct": "AcmeAssistant" }
+  "no_space_brands": [
+    "豆瓣FM"
   ],
-
-  "path_line_labels": ["前往路径", "路径", "入口"],
-  "path_context": ["设置", "系统设置"],
-
-  "internal_marks": ["待确认", "待补充", "待改写", "占位", "TODO", "TBD"],
-
+  "project_names": [
+    {
+      "wrong": [
+        "ACMEOS",
+        "Acme OS",
+        "ACME-OS"
+      ],
+      "correct": "AcmeOS"
+    },
+    {
+      "wrong": [
+        "acmeassistant",
+        "Acme-Assistant"
+      ],
+      "correct": "AcmeAssistant"
+    }
+  ],
+  "path_line_labels": [
+    "前往路径",
+    "路径",
+    "入口"
+  ],
+  "path_context": [
+    "设置",
+    "系统设置"
+  ],
+  "internal_marks": [
+    "待确认",
+    "待补充",
+    "待改写",
+    "占位",
+    "TODO",
+    "TBD"
+  ],
   "_rival_marks": "只报不改：归属确认前替换掉就是编造功能",
-  "rival_marks": ["CompetitorOS", "CompetitorAssistant"],
-
+  "rival_marks": [
+    "CompetitorOS",
+    "CompetitorAssistant"
+  ],
   "_typo_fix": "自动改。准入门槛：该写法在任何语境下都不可能正确，举得出合法用例的放 typo_pairs",
-  "typo_fix": [["comaptible", "compatible"]],
+  "typo_fix": [
+    [
+      "comaptible",
+      "compatible"
+    ]
+  ],
   "typo_fix_disable": [],
-
   "_typo_pairs": "只报不改：有歧义的词",
   "typo_pairs": [
-    ["登陆", "登录"],
-    ["炫光", "眩光"],
-    ["须要", "需要"]
+    [
+      "登陆",
+      "登录"
+    ],
+    [
+      "炫光",
+      "眩光"
+    ],
+    [
+      "须要",
+      "需要"
+    ]
   ],
-
-  "absolute_claims": ["数据不离开手机", "绝对安全", "100%", "永不", "万无一失"]
+  "absolute_claims": [
+    "数据不离开手机",
+    "绝对安全",
+    "100%",
+    "永不",
+    "万无一失"
+  ],
+  "spacing_engine": "utr59",
+  "spacing_language": "zh"
 }

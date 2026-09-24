@@ -1,0 +1,10 @@
+{
+  "spacing_revision": "UTR59-r1-draft-2024-12-16",
+  "grapheme_unicode": "16.0.0",
+  "dependency": "uniseg==0.10.0",
+  "files": {
+    "data/unicode/east-asian-spacing-utr59-r1.txt": "a8d007d71872ca6a7ea54403402f9b5e0d2670bd436389656e6aab5593f3146f",
+    "scripts/_vendor/uniseg-0.10.0-py3-none-any.whl": "d280cd632b75efe867aee798d66634426de31a9d29a3d79be208108e8cb45032",
+    "data/unicode/DerivedGeneralCategory-16.0.0.txt": "7676ab755a41ef82108460238569e60ad65c191ddafe61b36c6765ec1353f293"
+  }
+}

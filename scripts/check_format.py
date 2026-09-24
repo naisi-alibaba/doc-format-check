@@ -11,7 +11,30 @@ import json
 import os
 import re
 import sys
+import tempfile
+import stat
+from bisect import bisect_left, bisect_right
+from pathlib import Path
 from collections import defaultdict
+
+# Support both direct CLI use and importlib-based callers.
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+try:
+    from spacing import format_spacing
+    from unicode_adapter import ensure_ready, iter_graphemes, validate_resources, regex_class
+except (ImportError, OSError, ValueError) as exc:
+    if __name__ == '__main__':
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+        print('Incomplete Unicode runtime; reinstall the complete bundle: ' + str(exc), file=sys.stderr)
+        raise SystemExit(2)
+    raise
+
+DIGITS = regex_class({'Nd'})
+WORDS = regex_class({'Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Nd', 'Nl', 'No'}) + '_'
+
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_DIR = os.path.join(SKILL_DIR, 'profiles')
@@ -21,6 +44,8 @@ CJK_END = CJK + '）」』】》〉'      # 可作为中文句子成分结尾的
 FULL_PUNCT = '，。！？；：、「」『』（）《》〈〉【】…—'
 
 DEFAULTS = {
+    'spacing_engine': 'utr59',
+    'spacing_language': 'zh',
     'heading_level': None,        # null = 不检查分节标题层级
     'num_space': 'always',
     'quote_style': 'detect',      # detect = 只报混用
@@ -47,15 +72,17 @@ TECH_ALIAS = {'wifi': 'Wi-Fi', 'wi-fi': 'Wi-Fi', 'apps': 'App', 'typec': 'Type-C
               'osx': 'macOS'}
 TECH_WORD = re.compile(r'(?<![A-Za-z0-9])([A-Za-z][A-Za-z-]{1,7})(?![A-Za-z0-9])')
 
-# F16 词典。准入门槛：该写法在任何语境下都不可能正确；举得出合法用例的走 typo_pairs。
+# F16 常见错字；字形/地区/领域偏好默认只提示，项目可显式选择统一写法。
+STYLE_VARIANTS = {'帐号': '账号', '帐户': '账户', '帐单': '账单',
+                  '部份': '部分', '定单': '订单', '象素': '像素', '做为': '作为',
+                  '分辩': '分辨'}
 BUILTIN_ZH_TYPOS = {
-    '帐号': '账号', '帐户': '账户', '帐单': '账单',
     '按装': '安装', '设制': '设置', '按扭': '按钮',
-    '既使': '即使', '做为': '作为', '部份': '部分',
-    '必须品': '必需品', '定单': '订单',
-    '象素': '像素', '分辩率': '分辨率', '显视': '显示',
+    '既使': '即使',
+    '必须品': '必需品',
+    '分辩率': '分辨率', '显视': '显示',
     '摄相头': '摄像头', '剪切板': '剪贴板', '关健': '关键',
-    '分辩': '分辨', '辩别': '辨别',
+    '辩别': '辨别',
     '迫不急待': '迫不及待', '一如继往': '一如既往',
     '再接再励': '再接再厉', '甘败下风': '甘拜下风',
 }
@@ -102,9 +129,9 @@ def match_case(sample, word):
 # W 不收：可能是功率也可能是「万」，交 B09。
 UNITS = ['Gbps', 'Mbps', 'Kbps', 'mAh', 'nits', 'GHz', 'MHz', 'Hz', 'GB', 'MB', 'KB', 'TB',
          'fps', 'dpi', 'ppi', 'px', 'ms', 'cm', 'mm', 'kg']
-UNIT_RE = re.compile(r'(?<=\d)(?=(?:' + '|'.join(UNITS) + r')(?![A-Za-z]))')
+UNIT_RE = re.compile(r'(?<=[' + DIGITS + r'])(?=(?:' + '|'.join(UNITS) + r')(?![A-Za-z]))')
 # 例外：度数、百分比不加空格
-NO_SPACE_UNIT = re.compile(r'(?<=\d)\s+(?=[%°℃℉‰])')
+NO_SPACE_UNIT = re.compile(r'(?<=[' + DIGITS + r'])\s+(?=[%°℃℉‰])')
 
 DUP_PUNCT = re.compile(r'([，。！？；：、])\1+')
 # 表格单元格内边距（| 两侧的空格）不算「标点旁空格」，删了会把整表挤成一团
@@ -130,7 +157,7 @@ FW_TABLE = str.maketrans({
 })
 
 BAD_ABBR = re.compile(r'(?<![A-Za-z])(H5|h5|FED|Ts(?![A-Za-z])|RJS)(?![A-Za-z])')
-W_AS_WAN = re.compile(r'(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s?[Ww](?![A-Za-z])')
+W_AS_WAN = re.compile(r'(?<![A-Za-z0-9.])([0-9]+(?:\.[0-9]+)?)\s?[Ww](?![A-Za-z])')
 BAD_SEP = re.compile(r'(?<=[' + CJK + r'])\s*(-{1,2}>?|—+|→|／|/|>)\s*(?=[' + CJK + r'])')
 BOLD_LABEL = re.compile(r'^\s*\*\*[^*]+\*\*[：:]')
 THEMATIC_BREAK = re.compile(r'^\s{0,3}([-*_])\s*(?:\1\s*){2,}$')
@@ -169,13 +196,49 @@ RULES = {
 }
 
 
+def validate_profile(data):
+    if not isinstance(data, dict):
+        raise ValueError('profile 必须是 JSON 对象')
+    level = data.get('heading_level')
+    if level is not None and (type(level) is not int or not 2 <= level <= 6):
+        raise ValueError('heading_level 必须为 null 或 2—6 的整数')
+    for key, allowed in [('spacing_engine', ('utr59', 'legacy')), ('spacing_language', ('zh', 'non-zh', 'und')), ('num_space', ('always', 'never')), ('quote_style', ('detect', 'ignore', 'none'))]:
+        if key in data and data[key] not in allowed:
+            raise ValueError(f'{key} 可选值：{allowed}')
+    if 'name' in data and (not isinstance(data['name'], str) or not data['name']):
+        raise ValueError('profile name 必须为非空字符串')
+    if 'faq_heading' in data and data['faq_heading'] is not None and not isinstance(data['faq_heading'], str):
+        raise ValueError('faq_heading 必须是字符串或 null')
+    for key in ('no_space_brands', 'path_context', 'path_line_labels', 'internal_marks',
+                'rival_marks', 'absolute_claims', 'typo_fix_disable'):
+        if key in data and (not isinstance(data[key], list)
+                            or any(not isinstance(x, str) or not x for x in data[key])):
+            raise ValueError(f'{key} 必须是非空字符串组成的数组')
+    for key in ('typo_fix', 'typo_pairs'):
+        if key in data and (not isinstance(data[key], list) or any(
+                not isinstance(pair, (list, tuple)) or len(pair) != 2
+                or any(not isinstance(x, str) or not x for x in pair) for pair in data[key])):
+            raise ValueError(f'{key} 必须由两个非空字符串的词对组成')
+    if 'project_names' in data:
+        if not isinstance(data['project_names'], list):
+            raise ValueError('project_names 必须是数组')
+        for entry in data['project_names']:
+            if (not isinstance(entry, dict) or not isinstance(entry.get('correct'), str)
+                    or not entry['correct'] or not isinstance(entry.get('wrong'), list)
+                    or any(not isinstance(x, str) or not x for x in entry['wrong'])):
+                raise ValueError('project_names 的 correct 必须为非空字符串，wrong 为字符串数组')
+
+
 class Profile:
     """项目私有规则，全部从 JSON 挂进来。"""
 
     def __init__(self, data=None):
+        validate_profile({} if data is None else data)
         cfg = dict(DEFAULTS)
         cfg.update(data or {})
         self.name = cfg.get('name', 'generic')
+        self.spacing_engine = cfg['spacing_engine']
+        self.spacing_language = cfg['spacing_language']
         self.heading_level = cfg['heading_level']
         self.num_space = cfg['num_space']
         self.quote_style = cfg['quote_style']
@@ -218,7 +281,7 @@ class Profile:
                                       r')(?![A-Za-z])', re.I) if en else None)
 
         auto = set(zh) | set(en)          # 已进 F16 的不再由 B08 重复报
-        self.typo_pairs = [(re.compile(re.escape(a)), b) for a, b in cfg['typo_pairs']
+        self.typo_pairs = [(re.compile(re.escape(a)), b) for a, b in list(STYLE_VARIANTS.items()) + cfg['typo_pairs']
                            if a not in auto and a.lower() not in auto]
         self.typo_pairs.append((re.compile(r'的的|了了|是是|在在|和和'), '（重复字）'))
 
@@ -227,14 +290,21 @@ class Profile:
 
         protect = [
             r'```.*?```',                                   # 围栏代码
-            r'`[^`\n]+`',                                   # 行内代码
+            r'(`+)(?!`)(.+?)(?<!`)\1(?!`)',                                   # 行内代码
             r'!\[[^\]]*\]\([^)]*\)',                        # 图片
             r'\[[^\]]*\]\([^)]*\)',                         # 链接
+            r'!?\[[^\]\n]*\](?:\[[^\]\n]*\])?',  # references and conservative bracket text
+            r'<!--.*?-->',
+            r'&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);',
+            r"""\\[!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~]""",
+            r'(?<![' + WORDS + r'.+-])[' + WORDS + r'.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+            r'<[^>\n]+>',                                  # HTML / 自动链接
+            r'\[\[[^\]\n]+\]\]',                       # wikilinks
             r'https?://\S+',                                # 裸 URL
-            r'\b[\w.-]+\.(?:com|cn|net|org|io|dev)(?:/\S*)?',   # 域名
-            r'\b[\w-]+\.(?:md|txt|png|jpg|jpeg|mp4|json|py|sh|html|csv|tsv)\b',  # 文件名
-            r'\b\d+(?:\.\d+)+\b',                           # 版本号
-            r'\d{1,2}:\d{2}',                               # 时间
+            r'(?<![' + WORDS + r'])[' + WORDS + r'.-]+\.(?:com|cn|net|org|io|dev)(?:/\S*)?',   # 域名
+            r'(?<![' + WORDS + r'])[' + WORDS + r'-]+\.(?:md|txt|png|jpg|jpeg|mp4|json|py|sh|html|csv|tsv)(?![' + WORDS + r'])',  # 文件名
+            r'(?<![A-Za-z0-9_])[0-9]+(?:\.[0-9]+)+(?![A-Za-z0-9_])',                           # 版本号
+            r'[0-9]{1,2}:[0-9]{2}',                               # 时间
         ] + [re.escape(b) for b in self.no_space_brands]
         self.protect_re = re.compile('|'.join(protect), re.S)
 
@@ -265,7 +335,7 @@ def load_profile(ref):
     else:
         path = os.path.join(PROFILE_DIR, f'{ref}.json')
         if not os.path.exists(path):
-            raise SystemExit(f'找不到 profile：{ref}\n'
+            raise ValueError(f'找不到 profile：{ref}\n'
                              f'  查找过：{os.path.abspath(ref)}\n'
                              f'  查找过：{path}')
     with open(path, encoding='utf-8') as f:
@@ -278,17 +348,31 @@ SENTINEL = '\x00{}\x00'
 def mask(line, prof):
     store = []
 
-    def _grab(m):
-        store.append(m.group(0))
-        return SENTINEL.format(len(store) - 1)
-
-    return prof.protect_re.sub(_grab, line), store
+    spans = [(m.start(), m.end()) for m in prof.protect_re.finditer(line)]
+    if prof.spacing_engine == 'utr59' and spans and not line.isascii():
+        clusters = list(iter_graphemes(line))
+        starts = [a for a, _, _ in clusters]
+        ends = [b for _, b, _ in clusters]
+        spans = [(starts[bisect_right(ends, start)], ends[bisect_left(starts, end) - 1])
+                 for start, end in spans]
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    output, cursor = [], 0
+    for start, end in merged:
+        output.append(line[cursor:start])
+        store.append(line[start:end])
+        output.append(SENTINEL.format(len(store) - 1))
+        cursor = end
+    output.append(line[cursor:])
+    return ''.join(output), store
 
 
 def unmask(line, store):
-    for i, raw in enumerate(store):
-        line = line.replace(SENTINEL.format(i), raw)
-    return line
+    return re.sub(r'\x00([0-9]+)\x00', lambda m: store[int(m[1])], line)
 
 
 class Finding:
@@ -303,23 +387,45 @@ class Finding:
 
 
 def skip_flags(lines):
-    """逐行「不处理」表：frontmatter 与围栏代码块。"""
+    """保守保护 frontmatter、不同长度/类型围栏、缩进代码与引用定义。"""
     flags = [False] * len(lines)
     start = 0
     if lines and lines[0].strip() == '---':
-        for j in range(1, len(lines)):
-            if lines[j].strip() == '---':
-                for k in range(j + 1):
-                    flags[k] = True
-                start = j + 1
-                break
-    inside = False
+        end = next((j for j in range(1, len(lines))
+                    if lines[j].strip() in ('---', '...')), len(lines) - 1)
+        for j in range(end + 1):
+            flags[j] = True
+        start = end + 1
+    fence = None
     for i in range(start, len(lines)):
-        if lines[i].lstrip().startswith('```'):
+        line = re.sub(r'^(?: {0,3}>[ \t]?)+', '', lines[i])
+        if fence:
             flags[i] = True
-            inside = not inside
+            if re.fullmatch(r' {0,3}' + re.escape(fence[0]) +
+                            '{' + str(fence[1]) + r',}\s*', line):
+                fence = None
             continue
-        flags[i] = inside
+        match = re.match(r' {0,3}(`{3,}|~{3,})(.*)$', line)
+        if match and not (match[1][0] == '`' and '`' in match[2]):
+            fence = (match[1][0], len(match[1]))
+            flags[i] = True
+        elif line.startswith(('    ', '\t')) or re.match(r' {0,3}\[[^]]+\]:', line):
+            flags[i] = True
+    # Across-line code spans/comments: preserve whole intersecting physical lines.
+    # Already protected block content is blanked before scanning for inline spans.
+    text = '\n'.join(' ' * len(line) if flags[i] else line for i, line in enumerate(lines))
+    starts, offset = [], 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line) + 1
+    pattern = re.compile(r'<!--[\s\S]*?(?:-->|$)|(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)')
+    for match in pattern.finditer(text):
+        if '\n' not in match.group(0):
+            continue
+        first = bisect_right(starts, match.start()) - 1
+        last = bisect_right(starts, match.end() - 1) - 1
+        for i in range(first, last + 1):
+            flags[i] = True
     return flags
 
 
@@ -331,10 +437,23 @@ def fix_tech_names(text):
     return TECH_WORD.sub(_rep, text)
 
 
+KNOWN_CROSS_WORD = re.compile(
+    r'(?:决定|确定|判定|设定|指定|约定|限定|锁定|绑定|制定|选定|核定|规定)'
+    r'(?:单独|单位|单元|单个|单次|单项|单一|单价|单据|单点|单向|单列)')
+
+
+def is_known_cross_word(text, start, end, term):
+    if term != '定单':
+        return False
+    return any(m.start() <= start and end <= m.end() for m in KNOWN_CROSS_WORD.finditer(text))
+
+
 def fix_typos(text, prof, log):
     """F16：替换必错词，记录词级对比。"""
     if prof.zh_typo_re:
         def _zh(m):
+            if is_known_cross_word(text, m.start(), m.end(), m.group(0)):
+                return m.group(0)
             right = prof.zh_typos[m.group(0)]
             log.append(f'{m.group(0)} → {right}')
             return right
@@ -363,16 +482,16 @@ def fix_line(line, prof, num_space):
         return line, set(), []
 
     # F01 列表标记补空格。三条排除缺一不可：
-    #   (?![-*+]) 行首 ** 是加粗、-- 是分隔线；(?!\s) 已有空格；(?!\d) 小数
-    if re.match(r'^(\s{0,3})([-*+])(?![-*+\s])', masked):
-        masked = re.sub(r'^(\s{0,3})([-*+])', r'\1\2 ', masked, count=1)
+    #   (?![-*+]) 行首 ** 是加粗、-- 是分隔线；(?!\s) 已有空格；(?![0-9]) 小数
+    if re.match(r'^(\s{0,3})([-+])(?=[' + CJK + r'A-Za-z])', masked):
+        masked = re.sub(r'^(\s{0,3})([-+])', r'\1\2 ', masked, count=1)
         hits.add('F01')
-    if re.match(r'^(\s{0,3})(\d+)\.(?!\d)(?=\S)', masked):
-        masked = re.sub(r'^(\s{0,3})(\d+)\.', r'\1\2. ', masked, count=1)
+    if re.match(r'^(\s{0,3})([0-9]+)\.(?![0-9])(?=\S)', masked):
+        masked = re.sub(r'^(\s{0,3})([0-9]+)\.', r'\1\2. ', masked, count=1)
         hits.add('F01')
 
     # 行首语法后的空格是语法的一部分，隔离开否则会被 F12 删掉
-    pm = re.match(r'^(\s*(?:[-*+]|\d+\.|>|#{1,6})\s+)', masked)
+    pm = re.match(r'^(\s*(?:[-*+]|[0-9]+\.|>|#{1,6})\s+)', masked)
     prefix, body = (pm.group(1), masked[pm.end():]) if pm else ('', masked)
 
     def step(rule, new):
@@ -381,11 +500,11 @@ def fix_line(line, prof, num_space):
             body = new
             hits.add(rule)
 
+    step('F15', body.translate(FW_TABLE))
     step('F16', fix_typos(body, prof, typo_log))
     for label in prof.path_line_labels:
         step('F08', re.sub(r'\*\*(' + re.escape(label) + r'[：:][^*]*)\*\*', r'\1', body))
         step('F08', re.sub(r'\*\*(' + re.escape(label) + r')\*\*', r'\1', body))
-    step('F15', body.translate(FW_TABLE))
     for pat, good in prof.name_fixes:
         step('F03', pat.sub(lambda mm, g=good: mm.group(0) if mm.group(0) == g else g, body))
     step('F09', fix_tech_names(body))
@@ -408,11 +527,18 @@ def fix_line(line, prof, num_space):
     step('F14', HALF_PAREN.sub(lambda mm: '（' + mm.group(1) + '）', body))
     step('F13', DUP_PUNCT.sub(r'\1', body))
 
-    step('F02', re.sub(r'([' + CJK + r'])([A-Za-z])', r'\1 \2', body))
-    step('F02', re.sub(r'([A-Za-z])([' + CJK + r'])', r'\1 \2', body))
-    if num_space == 'always':
-        step('F10', re.sub(r'([' + CJK + r'])(?=\d)', r'\1 ', body))
-        step('F10', re.sub(r'(\d)(?=[' + CJK + r'])', r'\1 ', body))
+    if prof.spacing_engine == 'legacy':
+        step('F02', re.sub(r'([' + CJK + r'])([A-Za-z])', r'\1 \2', body))
+        step('F02', re.sub(r'([A-Za-z])([' + CJK + r'])', r'\1 \2', body))
+        if num_space == 'always':
+            step('F10', re.sub(r'([' + CJK + r'])(?=[' + DIGITS + r'])', r'\1 ', body))
+            step('F10', re.sub(r'([' + DIGITS + r'])(?=[' + CJK + r'])', r'\1 ', body))
+    else:
+        # Mask tokens and Markdown emphasis delimiters are opaque barriers.
+        barriers = [(m.start(), m.end()) for m in re.finditer(r'\x00[0-9]+\x00|\*+|_+|~{2,}', body)]
+        barriers += [(m.start(), m.end()) for m in prof.protect_re.finditer(body)]
+        body, spacing_hits = format_spacing(body, barriers, prof.spacing_language, num_space)
+        hits.update(spacing_hits)
     step('F11', UNIT_RE.sub(' ', body))
     step('F11', NO_SPACE_UNIT.sub('', body))
 
@@ -424,7 +550,12 @@ def fix_line(line, prof, num_space):
     masked = prefix + body
     if masked == orig:
         return line, set(), []
-    return unmask(masked, store), hits, typo_log
+    fixed = unmask(masked, store)
+    if line.endswith('  ') and line.strip():
+        fixed += '  '  # 两个行尾空格是 Markdown 硬换行
+    if fixed == line:
+        return line, set(), []
+    return fixed, hits, typo_log
 
 
 def fix_blank_lines(out, flags, findings, path):
@@ -433,10 +564,10 @@ def fix_blank_lines(out, flags, findings, path):
     for i, ln in enumerate(out):
         skip = flags[i]
         is_head = bool(re.match(r'^#{1,6}\s', ln)) and not skip
-        is_list = bool(re.match(r'^\s*(?:[-*+]|\d+\.)\s', ln)) and not skip
+        is_list = bool(re.match(r'^\s*(?:[-*+]|[0-9]+\.)\s', ln)) and not skip
         prev = res[-1] if res else None
         prev_blank = (prev is None) or (prev.strip() == '')
-        prev_list = bool(prev and re.match(r'^\s*(?:[-*+]|\d+\.)\s', prev))
+        prev_list = bool(prev and re.match(r'^\s*(?:[-*+]|[0-9]+\.)\s', prev))
 
         if is_head and not prev_blank and res:
             res.append('')
@@ -453,10 +584,19 @@ def fix_blank_lines(out, flags, findings, path):
     return res
 
 
+def decode_source(data):
+    encoding = 'utf-8-sig' if data.startswith(b'\xef\xbb\xbf') else 'utf-8'
+    raw = data.decode(encoding)
+    remainder = raw.replace('\r\n', '')
+    if ('\r\n' in raw and '\n' in remainder) or '\r' in remainder:
+        raise ValueError('不处理混合换行或单独 CR 的文件，请先明确换行规范')
+    return raw, encoding, '\r\n' if '\r\n' in raw else '\n'
+
+
 def scan_file(path, prof, do_fix, num_space):
-    with open(path, encoding='utf-8') as f:
-        raw = f.read()
-    lines = raw.split('\n')
+    source_bytes = Path(path).read_bytes()
+    raw, encoding, newline = decode_source(source_bytes)
+    lines = raw.replace('\r\n', '\n').split('\n')
     flags = skip_flags(lines)
     findings, out = [], list(lines)
 
@@ -473,7 +613,7 @@ def scan_file(path, prof, do_fix, num_space):
         # B 档跑原始行，避免 A 档改动干扰语义判断
         masked, _ = mask(ln, prof)
         for pat, rule, tip in (
-            (prof.internal_marks, 'B01', '内部标记不应留在面客正文，确认后再删'),
+            (prof.internal_marks, 'B01', '待判断标记；PRD/内部草稿中可保留，按文档用途核定，不自动删除'),
             (prof.rival_marks, 'B02', '第三方名称，归属确认前不要替换'),
             (prof.absolute_claims, 'B07', '对外承诺类表述，需确认可核验'),
         ):
@@ -483,7 +623,8 @@ def scan_file(path, prof, do_fix, num_space):
             if m:
                 findings.append(Finding(rule, path, i + 1, ln, f'命中「{m.group(0)}」：{tip}'))
         for pat, good in prof.typo_pairs:
-            m = pat.search(masked)
+            m = next((match for match in pat.finditer(masked)
+                      if not is_known_cross_word(masked, match.start(), match.end(), match.group(0))), None)
             if m:
                 findings.append(Finding('B08', path, i + 1, ln, f'「{m.group(0)}」疑应为「{good}」'))
         m = W_AS_WAN.search(masked)
@@ -507,9 +648,8 @@ def scan_file(path, prof, do_fix, num_space):
                 continue
             m = re.match(r'^(#{2,6})\s', l)
             if m and len(m.group(1)) != prof.heading_level:
-                findings.append(Finding('F04', path, i + 1, l,
-                                        f'分节标题统一为 H{prof.heading_level}，'
-                                        f'当前是 H{len(m.group(1))}'))
+                out[i] = '#' * prof.heading_level + out[i][len(m.group(1)):]
+                findings.append(Finding('F04', path, i + 1, l, out[i]))
 
     out = fix_blank_lines(out, flags, findings, path)
 
@@ -522,24 +662,27 @@ def scan_file(path, prof, do_fix, num_space):
 
     heads = [(i, l) for i, l in enumerate(lines) if re.match(r'^#{1,6}\s', l) and not flags[i]]
     for idx, (i, l) in enumerate(heads):
-        end = heads[idx + 1][0] if idx + 1 < len(heads) else len(lines)
-        if not any(s.strip() for s in lines[i + 1:end]):
+        level = len(l) - len(l.lstrip('#'))
+        end = next((position for position, heading in heads[idx + 1:]
+                    if len(heading) - len(heading.lstrip('#')) <= level), len(lines))
+        if not any(s.strip() and not re.match(r'^#{1,6}\s', s) for s in lines[i + 1:end]):
             findings.append(Finding('B06', path, i + 1, l, '标题下无正文，确认是补内容还是删标题'))
         if prof.faq_heading and prof.faq_heading in l:
-            for j in range(i + 1, end):
+            direct_end = heads[idx + 1][0] if idx + 1 < len(heads) else len(lines)
+            for j in range(i + 1, direct_end):
                 if re.match(r'^\s*[-*+]\s', lines[j]) and '？' not in lines[j] and '?' not in lines[j]:
                     findings.append(Finding('B05', path, j + 1, lines[j], '条目应为「Q？A」形式'))
 
     i = 0
     while i < len(lines):
-        if flags[i] or not re.match(r'^\s*\d+\.\s', lines[i]):
+        if flags[i] or not re.match(r'^\s*[0-9]+\.\s', lines[i]):
             i += 1
             continue
         j = i
-        while j < len(lines) and (re.match(r'^\s*\d+\.\s', lines[j]) or not lines[j].strip()):
+        while j < len(lines) and (re.match(r'^\s*[0-9]+\.\s', lines[j]) or not lines[j].strip()):
             j += 1
         block = [l for l in lines[i:j] if l.strip()]
-        labeled = [l for l in block if re.match(r'^\s*\d+\.\s*[^：:，。]{2,12}[：:]', l)]
+        labeled = [l for l in block if re.match(r'^\s*[0-9]+\.\s*[^：:，。]{2,12}[：:]', l)]
         if len(labeled) >= 2:
             findings.append(Finding('B04', path, i + 1, block[0],
                                     f'该有序列表 {len(block)} 条中有 {len(labeled)} 条是「标签：说明」式，'
@@ -568,24 +711,79 @@ def scan_file(path, prof, do_fix, num_space):
             findings.append(Finding('B10', path, 0, f'末级菜单「{tail}」',
                                     '文内出现多种写法：' + ' / '.join(sorted(variants))))
 
-    new_raw = '\n'.join(out).rstrip('\n') + '\n'
+    new_raw = newline.join(out)
     if do_fix and new_raw != raw:
-        with open(path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(new_raw)
+        atomic_write(path, new_raw.encode(encoding))
     return findings
 
 
+def atomic_write(path, data):
+    """同目录临时文件替换；逐文件原子写入，并非整批事务。"""
+    target = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.' + target.name + '.', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        if target.exists():
+            os.chmod(temporary, target.stat().st_mode)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+            os.unlink(temporary)
+
+
+def is_reparse(path):
+    """Junction/reparse detection also works on Python 3.10/3.11."""
+    try:
+        attrs = getattr(Path(path).lstat(), 'st_file_attributes', 0)
+        return Path(path).is_symlink() or bool(attrs & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+    except FileNotFoundError:
+        return False
+
+
 def collect(targets):
-    files = []
-    for t in targets:
-        if os.path.isdir(t):
-            for root, _, names in os.walk(t):
-                files += [os.path.join(root, n) for n in sorted(names) if n.endswith('.md')]
-        elif os.path.isfile(t):
-            files.append(t)
+    files = {}
+    excluded = {'.git', '.venv', 'node_modules', '__pycache__'}
+    for value in targets:
+        target = Path(value)
+        if is_reparse(target) or any(is_reparse(parent) for parent in target.absolute().parents):
+            raise ValueError(f'不处理符号链接：{target}')
+        if target.is_dir():
+            scan_root = target.resolve()
+            for root, dirs, names in os.walk(target):
+                dirs[:] = sorted(d for d in dirs if d not in excluded
+                                  and not is_reparse(Path(root, d))
+                                  and scan_root in Path(root, d).resolve().parents)
+                for name in sorted(names):
+                    child = Path(root, name)
+                    if (child.suffix.lower() == '.md' and not is_reparse(child)
+                            and scan_root in child.resolve().parents):
+                        files[str(child.resolve())] = str(child)
+        elif target.is_file() and target.suffix.lower() == '.md':
+            files[str(target.resolve())] = str(target)
         else:
-            print(f'[跳过] 找不到：{t}', file=sys.stderr)
-    return files
+            raise ValueError(f'不是有效的 Markdown 文件或目录：{target}')
+    return list(files.values())
+
+
+def validate_report(report, targets):
+    if is_reparse(Path(report)):
+        raise ValueError('报告不能使用符号链接或 reparse point')
+    path = Path(report).resolve()
+    if path.exists() and not path.stat().st_mode & stat.S_IWUSR:
+        raise ValueError('报告文件不可写，未修改正文')
+    if not path.parent.is_dir() or path.is_dir():
+        raise ValueError('报告父目录必须已存在，报告路径必须是文件')
+    for value in targets:
+        target = Path(value).resolve()
+        if path == target or (target.is_dir() and target in path.parents):
+            raise ValueError('报告必须位于扫描范围之外，不能覆盖输入或进入下一次扫描')
+    # 在任何正文写入前确认报告目录可写，不覆盖已有报告。
+    fd, probe = tempfile.mkstemp(prefix='.docformat-probe-', dir=path.parent)
+    os.close(fd)
+    os.unlink(probe)
+
 
 
 def write_report(path, findings, files, prof, applied):
@@ -642,16 +840,21 @@ def write_report(path, findings, files, prof, applied):
             L.append(f'   - 建议：{f.suggest}')
         L.append('')
 
-    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write('\n'.join(L))
+    atomic_write(path, '\n'.join(L).encode('utf-8'))
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     ap = argparse.ArgumentParser()
     ap.add_argument('targets', nargs='+')
     ap.add_argument('--profile', default=None,
                     help=f'内置 profile 名，或指向 JSON 的路径。'
                          f'省略时自动向上查找 {PROFILE_FILENAME}，找不到则用 generic')
+    ap.add_argument('--spacing-engine', choices=['utr59', 'legacy'])
+    ap.add_argument('--spacing-language', choices=['zh', 'non-zh', 'und'])
+    ap.add_argument('--version', action='version', version='doc-format-check 2.0.0')
     ap.add_argument('--fix', action='store_true', help='就地应用 A 档修复（先自行备份）')
     ap.add_argument('--num-space', default=None, choices=['always', 'never'],
                     help='中文与数字之间空格；不给则用 profile 设置')
@@ -660,29 +863,37 @@ def main():
                     help='把改前/改后对比记录写成 Markdown 文件（放在扫描范围之外）')
     args = ap.parse_args()
 
-    profile_ref, auto = args.profile, ''
-    if profile_ref is None:
-        found = discover_profile(args.targets[0])
-        if found:
-            profile_ref, auto = found, f'（自动发现：{found}）'
-        else:
-            profile_ref = 'generic'
-    prof = load_profile(profile_ref)
-    num_space = args.num_space or prof.num_space
-
-    files = collect(args.targets)
-    if not files:
-        print('没有可处理的 .md 文件', file=sys.stderr)
+    if args.fix and not args.report:
+        ap.error('--fix 必须指定扫描范围外的 --report，以保留前后对比')
+    try:
+        validate_resources()
+        ensure_ready()
+        files = collect(args.targets)
+        if not files:
+            raise ValueError('没有可处理的 .md 文件')
+        if args.report:
+            validate_report(args.report, args.targets)
+        jobs = []
+        for p in files:
+            # 整批预读，编码或配置错误在修改任何正文之前报告。
+            decode_source(Path(p).read_bytes())
+            if args.fix and not Path(p).stat().st_mode & stat.S_IWUSR:
+                raise ValueError(f'正文不可写：{p}')
+            profile_ref = args.profile or discover_profile(p) or 'generic'
+            profile = load_profile(profile_ref)
+            if args.spacing_engine:
+                profile.spacing_engine = args.spacing_engine
+            if args.spacing_language:
+                profile.spacing_language = args.spacing_language
+            jobs.append((p, profile, args.num_space or profile.num_space))
+        all_f = []
+        for p, profile, spacing in jobs:
+            all_f += scan_file(p, profile, args.fix, spacing)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f'[失败] {exc}', file=sys.stderr)
         return 2
-
-    all_f = []
-    for p in files:
-        try:
-            all_f += scan_file(p, prof, args.fix, num_space)
-        except Exception as e:  # noqa: BLE001
-            print(f'[失败] {p}：{e}', file=sys.stderr)
-            return 2
-
+    prof = Profile({'name': ' / '.join(sorted({job[1].name for job in jobs}))})
+    auto = '' if args.profile else '（按各文件目录发现 profile）'
     a = [f for f in all_f if f.tier == 'A']
     b = [f for f in all_f if f.tier == 'B']
     verb = '已修' if args.fix else '可自动修'
@@ -710,8 +921,16 @@ def main():
         print()
 
     if args.report:
-        write_report(args.report, all_f, files, prof, args.fix)
+        try:
+            write_report(args.report, all_f, files, prof, args.fix)
+        except OSError as exc:
+            print(f'[失败] 报告写入失败；以上控制台保留本次改动：{exc}', file=sys.stderr)
+            return 2
         print(f'对比记录已写入：{args.report}')
+    if args.fix:
+        remaining = [finding for p, profile, spacing in jobs
+                     for finding in scan_file(p, profile, False, spacing)]
+        return 1 if remaining else 0
     return 1 if all_f else 0
 
 

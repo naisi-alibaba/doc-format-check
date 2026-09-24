@@ -2,3 +2,10 @@
 *.py text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+
+*.txt text eol=lf
+*.whl binary
+
+# Fixed upstream snapshots: preserve byte-level digests across checkouts.
+data/unicode/*.txt -text -whitespace
+tests/fixtures/unicode-16/*.txt -text -whitespace
